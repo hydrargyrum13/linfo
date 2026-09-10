@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+set -u
+
+VERSION="0.1.0"
+C_RESET='\033[0m'
+C_CYAN='\033[36m'
+C_DIM='\033[2m'
+C_GREEN='\033[32m'
+C_YELLOW='\033[33m'
+C_RED='\033[31m'
+
+have(){ command -v "$1" >/dev/null 2>&1; }
+header(){ printf "\n${C_CYAN}  %s${C_RESET}\n${C_DIM}  %s${C_RESET}\n" "$1" "$(printf '%*s' "${#1}" '' | tr ' ' '─')"; }
+kv(){ printf "${C_DIM}  %-20s${C_RESET}%s\n" "$1" "$2"; }
+warn(){ printf "${C_YELLOW}%s${C_RESET}\n" "$1"; }
+bad(){ printf "${C_RED}%s${C_RESET}\n" "$1"; }
+
+show_cpu(){
+  case "${1:-}" in
+    temp)
+      if have sensors; then sensors | awk '/Package id|Tctl|Tdie|Core [0-9]+/ {print}'; else warn "CPU temperature unavailable. Install lm-sensors and run sensors-detect."; fi; return;;
+    load)
+      read -r l1 l5 l15 _ < /proc/loadavg; printf "1m: %s\n5m: %s\n15m: %s\n" "$l1" "$l5" "$l15"; return;;
+    clock)
+      awk -F: '/cpu MHz/ {sum+=$2;n++} END{if(n) printf "Average: %.0f MHz\n",sum/n}' /proc/cpuinfo; return;;
+  esac
+  header "CPU"
+  model=$(awk -F: '/model name/ {gsub(/^ /,"",$2); print $2; exit}' /proc/cpuinfo)
+  kv "Model" "$model"
+  kv "Architecture" "$(uname -m)"
+  kv "Cores" "$(awk -F: '/cpu cores/ {gsub(/ /,"",$2); print $2; exit}' /proc/cpuinfo)"
+  kv "Threads" "$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo)"
+}
+
+show_gpu(){
+  case "${1:-}" in
+    temp)
+      if have sensors; then sensors | awk 'BEGIN{IGNORECASE=1} /gpu|edge|junction/ {print}'; else warn "GPU temperature unavailable. Install lm-sensors or use your vendor tool."; fi; return;;
+    load)
+      if have nvidia-smi; then nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader; elif [ -r /sys/class/drm/card0/device/gpu_busy_percent ]; then cat /sys/class/drm/card0/device/gpu_busy_percent | awk '{print $1"%"}'; else warn "GPU load unavailable."; fi; return;;
+    vram)
+      if have nvidia-smi; then nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader; else warn "VRAM usage unavailable with current drivers/tools."; fi; return;;
+  esac
+  header "GPU"
+  if have lspci; then lspci | grep -Ei 'VGA|3D|Display' || true; else warn "lspci not installed."; fi
+}
+
+show_ram(){
+  case "${1:-}" in
+    usage) free -h 2>/dev/null || cat /proc/meminfo; return;;
+    modules) if have dmidecode; then sudo -n dmidecode --type memory 2>/dev/null | grep -E 'Size:|Type:|Speed:|Manufacturer:|Part Number:'; else warn "dmidecode not installed."; fi; return;;
+  esac
+  header "Memory"
+  free -h 2>/dev/null || cat /proc/meminfo
+}
+
+show_disk(){
+  case "${1:-}" in
+    usage) df -hT; return;;
+    health)
+      if have smartctl; then for d in /dev/sd? /dev/nvme?n1; do [ -e "$d" ] && { echo "$d"; sudo -n smartctl -H "$d" 2>/dev/null | grep -E 'SMART overall-health|SMART Health Status|overall-health'; }; done; else warn "smartctl not installed. Install smartmontools for SMART health."; fi; return;;
+    temp)
+      if have sensors; then sensors | awk 'BEGIN{IGNORECASE=1} /nvme|composite/ {print}'; else warn "Disk temperature unavailable. Install lm-sensors or smartmontools."; fi; return;;
+  esac
+  header "Storage"
+  if have lsblk; then lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS,MODEL,TRAN; else df -hT; fi
+}
+
+show_os(){ header "Linux"; [ -r /etc/os-release ] && . /etc/os-release && kv "Distribution" "${PRETTY_NAME:-Linux}"; kv "Kernel" "$(uname -sr)"; kv "Architecture" "$(uname -m)"; kv "Hostname" "$(hostname)"; kv "Uptime" "$(uptime -p 2>/dev/null || cut -d. -f1 /proc/uptime)"; }
+show_network(){
+  case "${1:-}" in
+    ip) if have ip; then ip -brief address; else hostname -I; fi; return;;
+    dns) if have resolvectl; then resolvectl dns; else grep '^nameserver' /etc/resolv.conf; fi; return;;
+    public) if have curl; then curl -fsS https://api.ipify.org; echo; elif have wget; then wget -qO- https://api.ipify.org; echo; else warn "curl or wget required."; fi; return;;
+    ports) if have ss; then ss -lntup; elif have netstat; then netstat -lntup; else warn "ss/netstat unavailable."; fi; return;;
+  esac
+  header "Network"
+  if have ip; then ip -brief link; echo; ip -brief address; else ifconfig 2>/dev/null || hostname -I; fi
+}
+show_wifi(){
+  case "${1:-}" in signal) if have iwconfig; then iwconfig 2>/dev/null | grep -E 'ESSID|Signal level'; elif have nmcli; then nmcli -f IN-USE,SSID,SIGNAL,RATE dev wifi | head -20; else warn "No Wi-Fi CLI tool found."; fi; return;; esac
+  if have nmcli; then nmcli -f GENERAL.DEVICE,GENERAL.TYPE,GENERAL.STATE,GENERAL.CONNECTION dev show | sed -n '/wifi/,+3p'; nmcli -f IN-USE,SSID,SIGNAL,RATE dev wifi | head -20
+  elif have iwconfig; then iwconfig 2>/dev/null; else warn "nmcli/iwconfig unavailable."; fi
+}
+show_usb(){ if have lsusb; then lsusb; else warn "lsusb not installed."; fi; }
+show_audio(){ if have pactl; then pactl info | grep -E 'Default Sink|Default Source|Server Name'; pactl list short sinks; elif have wpctl; then wpctl status; else warn "pactl/wpctl unavailable."; fi; }
+show_display(){ if have xrandr && [ -n "${DISPLAY:-}" ]; then xrandr --current; elif have wlr-randr; then wlr-randr; else warn "Display information tool unavailable for this session."; fi; }
+show_processes(){ ps -eo pid,comm,%cpu,%mem --sort=-%cpu | head -n "${1:-16}"; }
+show_services(){ if have systemctl; then systemctl --no-pager --type=service --state=running | head -n 40; else warn "systemd not detected."; fi; }
+show_startup(){ if have systemctl; then systemctl list-unit-files --state=enabled --no-pager | head -n 50; else warn "systemd not detected."; fi; }
+show_packages(){ if have dpkg; then dpkg-query -W -f='${binary:Package}\t${Version}\n' | grep -i "${1:-}" | head -n 100; elif have rpm; then rpm -qa | grep -i "${1:-}" | head -n 100; elif have pacman; then pacman -Q | grep -i "${1:-}" | head -n 100; else warn "Supported package manager database not found."; fi; }
+show_kernel(){ header "Kernel"; uname -a; [ -r /proc/cmdline ] && { echo; kv "Boot args" "$(cat /proc/cmdline)"; }; }
+show_uptime(){ uptime -p 2>/dev/null || cat /proc/uptime; }
+show_temps(){ if have sensors; then sensors; else warn "No sensor provider detected. Install lm-sensors."; fi; }
+show_health(){ header "System health"; kv "Load" "$(cut -d' ' -f1-3 /proc/loadavg)"; kv "Memory" "$(free -h | awk '/Mem:/ {print $3" / "$2}')"; kv "Root usage" "$(df -h / | awk 'NR==2 {print $3" / "$2" ("$5")"}')"; if have sensors; then sensors | awk '/Package id 0|Tctl|Tdie/ {print "  CPU temp            "$0; exit}'; fi; }
+show_doctor(){ header "linfo doctor"; for c in bash lsblk ip ss lspci sensors smartctl nmcli systemctl; do if have "$c"; then kv "$c" "available"; else kv "$c" "missing"; fi; done; }
+show_help(){ cat <<'EOF'
+
+  summary               Compact system overview
+  health                Quick system health overview
+  temps                 All sensor temperatures
+  cpu                    CPU details
+  cpu temp|load|clock    CPU subcommands
+  gpu                    GPU details
+  gpu temp|load|vram     GPU subcommands
+  ram                    Memory details
+  ram usage|modules      Memory subcommands
+  disk                   Storage details
+  disk usage|health|temp Storage subcommands
+  os                     Distribution, kernel and uptime
+  kernel                 Kernel and boot arguments
+  display                Display outputs
+  wifi                   Wi-Fi details
+  wifi signal            Wi-Fi signal info
+  usb                    USB devices
+  audio                  Audio devices
+  network                Network overview
+  network ip|dns|public|ports
+  processes [n]          Top processes
+  services               Running services
+  startup                Enabled systemd units
+  packages [query]       Installed packages
+  uptime                 Uptime only
+  doctor                 Check available providers/tools
+  clear                  Clear interactive shell
+  exit                   Leave interactive shell
+EOF
+}
+show_summary(){ show_os; show_cpu; show_ram; show_disk; }
+
+invoke(){
+  local cmd="${1:-summary}"; shift 2>/dev/null || true
+  case "$cmd" in
+    summary) show_summary;; health) show_health;; temps|temp) show_temps;;
+    cpu) show_cpu "${1:-}";; gpu) show_gpu "${1:-}";; ram|memory) show_ram "${1:-}";; disk|storage) show_disk "${1:-}";;
+    os|system) show_os;; kernel) show_kernel;; display|monitor) show_display;; wifi) show_wifi "${1:-}";; usb) show_usb;; audio) show_audio;;
+    network|net) show_network "${1:-}";; dns) show_network dns;; publicip) show_network public;; ports) show_network ports;;
+    processes|ps) show_processes "${1:-}";; services) show_services;; startup) show_startup;; packages|apps) show_packages "${1:-}";; uptime) show_uptime;; doctor) show_doctor;;
+    help|-h|--help) show_help;; version|--version) echo "linfo $VERSION";;
+    *) bad "Unknown command: $cmd"; printf "${C_DIM}Run: linfo help${C_RESET}\n";;
+  esac
+}
+
+banner(){
+  printf "${C_CYAN}\n"
+  cat <<'EOF'
+  _     ___ _   _ _____ ___  
+ | |   |_ _| \ | |  ___/ _ \ 
+ | |    | ||  \| | |_ | | | |
+ | |___ | || |\  |  _|| |_| |
+ |_____|___|_| \_|_|   \___/ 
+EOF
+  printf "${C_RESET}${C_DIM}\n  Linux information, without the scavenger hunt.  v%s\n  Type help to see commands.${C_RESET}\n\n" "$VERSION"
+}
+interactive(){
+  banner
+  while true; do
+    printf "${C_CYAN}linfo${C_RESET}${C_DIM} › ${C_RESET}"
+    IFS= read -r line || break
+    [ -z "$line" ] && continue
+    case "$line" in exit|quit|q) break;; clear|cls) clear; banner; continue;; esac
+    read -r -a parts <<< "$line"
+    invoke "${parts[@]}"
+  done
+}
+
+if [ "$#" -eq 0 ]; then interactive; else invoke "$@"; fi
